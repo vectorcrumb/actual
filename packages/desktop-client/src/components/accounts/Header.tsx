@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { ComponentProps, ReactNode } from 'react';
 import { Dialog, DialogTrigger } from 'react-aria-components';
 import { useHotkeys } from 'react-hotkeys-hook';
@@ -33,9 +33,11 @@ import type {
   TransactionEntity,
   TransactionFilterEntity,
 } from '@actual-app/core/types/models';
-import { format as formatDate } from 'date-fns';
+import { format as formatDate, subDays, subMonths } from 'date-fns';
 
 import { AnimatedRefresh } from '#components/AnimatedRefresh';
+import * as query from '#queries';
+import { liveQuery } from '#queries/liveQuery';
 import { Search } from '#components/common/Search';
 import { FilterButton } from '#components/filters/FiltersMenu';
 import { FiltersStack } from '#components/filters/FiltersStack';
@@ -203,6 +205,77 @@ export function AccountHeader({
   );
   const showNetWorthChart = showNetWorthChartPref === 'true';
 
+  const [chartRange, setChartRange] = useState<
+    '30d' | '3m' | '6m' | '1y' | 'all'
+  >('1y');
+
+  const [firstTransactionDate, setFirstTransactionDate] = useState<
+    Date | null
+  >(null);
+
+  useEffect(() => {
+    const firstTransactionQuery = query
+      .transactions(accountId)
+      .orderBy({ date: 'asc' })
+      .limit(1)
+      .select(['date']);
+
+    const live = liveQuery<{ date: string }>(firstTransactionQuery, {
+      onData: (data: Array<{ date: string }>) => {
+        if (data[0]?.date) {
+          setFirstTransactionDate(new Date(data[0].date));
+        } else {
+          setFirstTransactionDate(null);
+        }
+      },
+    });
+
+    return () => live?.unsubscribe();
+  }, [accountId]);
+
+  const { chartStartDate, chartEndDate, chartGranularity } = useMemo(() => {
+    const end = new Date();
+    switch (chartRange) {
+      case '30d':
+        return {
+          chartStartDate: subDays(end, 30),
+          chartEndDate: end,
+          chartGranularity: 'day' as const,
+        };
+      case '3m':
+        return {
+          chartStartDate: subMonths(end, 3),
+          chartEndDate: end,
+          chartGranularity: 'day' as const,
+        };
+      case '6m':
+        return {
+          chartStartDate: subMonths(end, 6),
+          chartEndDate: end,
+          chartGranularity: 'month' as const,
+        };
+      case '1y':
+        return {
+          chartStartDate: subMonths(end, 12),
+          chartEndDate: end,
+          chartGranularity: 'month' as const,
+        };
+      case 'all': {
+        const eighteenMonthsAgo = subMonths(end, 18);
+        const allStart =
+          firstTransactionDate !== null &&
+          firstTransactionDate < eighteenMonthsAgo
+            ? firstTransactionDate
+            : eighteenMonthsAgo;
+        return {
+          chartStartDate: allStart,
+          chartEndDate: end,
+          chartGranularity: 'month' as const,
+        };
+      }
+    }
+  }, [chartRange, firstTransactionDate]);
+
   const dateFormat = useDateFormat() || 'MM/dd/yyyy';
   const locale = useLocale();
 
@@ -321,15 +394,49 @@ export function AccountHeader({
             />
           </View>
 
-          <BalanceHistoryGraph
-            ref={graphRef}
-            accountId={accountId}
-            style={{
-              height: 'calc(5vh + 5vw)',
-              margin: 0,
-              display: showNetWorthChart ? 'flex' : 'none',
-            }}
-          />
+          {showNetWorthChart && (
+            <View>
+              <View
+                style={{
+                  flexDirection: 'row',
+                  gap: 2,
+                  alignSelf: 'flex-end',
+                  marginBottom: 2,
+                }}
+              >
+                {(
+                  [
+                    { key: '30d', label: '30D' },
+                    { key: '3m', label: '3M' },
+                    { key: '6m', label: '6M' },
+                    { key: '1y', label: '1Y' },
+                    { key: 'all', label: 'All' },
+                  ] as const
+                ).map(({ key, label }) => (
+                  <Button
+                    key={key}
+                    variant={chartRange === key ? 'normal' : 'bare'}
+                    onPress={() => setChartRange(key)}
+                    style={{
+                      padding: '2px 6px',
+                      fontSize: 11,
+                      minWidth: 0,
+                    }}
+                  >
+                    {label}
+                  </Button>
+                ))}
+              </View>
+              <BalanceHistoryGraph
+                ref={graphRef}
+                accountId={accountId}
+                granularity={chartGranularity}
+                startDate={chartStartDate}
+                endDate={chartEndDate}
+                style={{ height: 'calc(5vh + 5vw)', margin: 0 }}
+              />
+            </View>
+          )}
         </View>
         <SpaceBetween gap={10} style={{ marginTop: 12 }}>
           {canSync && (

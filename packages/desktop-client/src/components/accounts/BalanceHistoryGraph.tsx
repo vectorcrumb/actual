@@ -9,7 +9,14 @@ import { theme } from '@actual-app/components/theme';
 import { View } from '@actual-app/components/view';
 import * as monthUtils from '@actual-app/core/shared/months';
 import { integerToCurrency } from '@actual-app/core/shared/util';
-import { eachMonthOfInterval, format, subMonths } from 'date-fns';
+import {
+  differenceInCalendarDays,
+  eachDayOfInterval,
+  eachMonthOfInterval,
+  format,
+  subDays,
+  subMonths,
+} from 'date-fns';
 import { Area, AreaChart, Tooltip as RechartsTooltip, YAxis } from 'recharts';
 
 import { PrivacyFilter } from '#components/PrivacyFilter';
@@ -25,12 +32,18 @@ type BalanceHistoryGraphProps = {
   accountId?: string;
   style?: CSSProperties;
   ref?: Ref<HTMLDivElement>;
+  granularity?: 'day' | 'month';
+  startDate?: Date;
+  endDate?: Date;
 };
 
 export function BalanceHistoryGraph({
   accountId,
   style,
   ref,
+  granularity = 'month',
+  startDate: startDateProp,
+  endDate: endDateProp,
 }: BalanceHistoryGraphProps) {
   const locale = useLocale();
   const animationProps = useRechartsAnimation({ isAnimationActive: false });
@@ -61,30 +74,54 @@ export function BalanceHistoryGraph({
   );
 
   useEffect(() => {
-    // Reset state when accountId changes
+    // Reset state when accountId or range changes
     setStartingBalance(null);
     setMonthlyTotals(null);
     setLoading(true);
 
-    const endDate = new Date();
-    const startDate = subMonths(endDate, 12);
+    const endDate = endDateProp ?? new Date();
+    const startDate =
+      startDateProp ??
+      (granularity === 'day' ? subDays(endDate, 30) : subMonths(endDate, 12));
+
+    const rangeStartDay = monthUtils.dayFromDate(startDate);
+    const rangeEndDay = monthUtils.dayFromDate(endDate);
 
     const startingBalanceQuery = query
       .transactions(accountId)
       .filter({
-        date: { $lt: monthUtils.firstDayOfMonth(startDate) },
+        date: { $lt: rangeStartDay },
       })
       .calculate({ $sum: '$amount' });
-    const monthlyTotalsQuery = query
-      .transactions(accountId)
-      .filter({
-        $and: [
-          { date: { $gte: monthUtils.firstDayOfMonth(startDate) } },
-          { date: { $lte: monthUtils.lastDayOfMonth(endDate) } },
-        ],
-      })
-      .groupBy({ $month: '$date' })
-      .select([{ date: { $month: '$date' } }, { amount: { $sum: '$amount' } }]);
+
+    const periodTotalsQuery =
+      granularity === 'day'
+        ? query
+            .transactions(accountId)
+            .filter({
+              $and: [
+                { date: { $gte: rangeStartDay } },
+                { date: { $lte: rangeEndDay } },
+              ],
+            })
+            .groupBy({ $day: '$date' })
+            .select([
+              { date: { $day: '$date' } },
+              { amount: { $sum: '$amount' } },
+            ])
+        : query
+            .transactions(accountId)
+            .filter({
+              $and: [
+                { date: { $gte: monthUtils.firstDayOfMonth(startDate) } },
+                { date: { $lte: monthUtils.lastDayOfMonth(endDate) } },
+              ],
+            })
+            .groupBy({ $month: '$date' })
+            .select([
+              { date: { $month: '$date' } },
+              { amount: { $sum: '$amount' } },
+            ]);
 
     const startingBalanceLive: ReturnType<typeof liveQuery<number>> = liveQuery(
       startingBalanceQuery,
@@ -101,7 +138,7 @@ export function BalanceHistoryGraph({
 
     const monthlyTotalsLive: ReturnType<
       typeof liveQuery<{ date: string; amount: number }>
-    > = liveQuery(monthlyTotalsQuery, {
+    > = liveQuery(periodTotalsQuery, {
       onData: (data: Array<{ date: string; amount: number }>) => {
         setMonthlyTotals(
           data.map(d => ({
@@ -111,7 +148,7 @@ export function BalanceHistoryGraph({
         );
       },
       onError: error => {
-        console.error('Error fetching monthly totals:', error);
+        console.error('Error fetching period totals:', error);
         setLoading(false);
       },
     });
@@ -120,73 +157,86 @@ export function BalanceHistoryGraph({
       startingBalanceLive?.unsubscribe();
       monthlyTotalsLive?.unsubscribe();
     };
-  }, [accountId, locale]);
+  }, [accountId, granularity, startDateProp, endDateProp, locale]);
 
   // Process data when both startingBalance and monthlyTotals are available
   useEffect(() => {
     if (startingBalance !== null && monthlyTotals !== null) {
-      const endDate = new Date();
-      const startDate = subMonths(endDate, 12);
-      const months = eachMonthOfInterval({
-        start: startDate,
-        end: endDate,
-      }).map(m => format(m, 'yyyy-MM'));
+      const endDate = endDateProp ?? new Date();
+      const startDate =
+        startDateProp ??
+        (granularity === 'day' ? subDays(endDate, 30) : subMonths(endDate, 12));
+
+      const periods =
+        granularity === 'day'
+          ? eachDayOfInterval({ start: startDate, end: endDate }).map(d =>
+              format(d, 'yyyy-MM-dd'),
+            )
+          : eachMonthOfInterval({ start: startDate, end: endDate }).map(m =>
+              format(m, 'yyyy-MM'),
+            );
 
       function processData(
         startingBalanceValue: number,
-        monthlyTotalsValue: Array<{ date: string; balance: number }>,
+        periodTotalsValue: Array<{ date: string; balance: number }>,
       ) {
         let currentBalance = startingBalanceValue;
-        const totals = [...monthlyTotalsValue];
-        totals.reverse().forEach(month => {
-          currentBalance = currentBalance + month.balance;
-          month.balance = currentBalance;
+        const totals = [...periodTotalsValue];
+        totals.reverse().forEach(period => {
+          currentBalance = currentBalance + period.balance;
+          period.balance = currentBalance;
         });
 
         // if the account doesn't have recent transactions
-        // then the empty months will be missing from our data
+        // then the empty periods will be missing from our data
         // so add in entries for those here
         if (totals.length === 0) {
-          //handle case of no transactions in the last year
-          months.forEach(expectedMonth =>
+          periods.forEach(expectedPeriod =>
             totals.push({
-              date: expectedMonth,
+              date: expectedPeriod,
               balance: startingBalanceValue,
             }),
           );
-        } else if (totals.length < months.length) {
+        } else if (totals.length < periods.length) {
           // iterate through each array together and add in missing data
           let totalsIndex = 0;
           let mostRecent = startingBalanceValue;
-          months.forEach(expectedMonth => {
+          periods.forEach(expectedPeriod => {
             if (totalsIndex > totals.length - 1) {
               // fill in the data at the end of the window
               totals.push({
-                date: expectedMonth,
+                date: expectedPeriod,
                 balance: mostRecent,
               });
-            } else if (totals[totalsIndex].date === expectedMonth) {
-              // a matched month
+            } else if (totals[totalsIndex].date === expectedPeriod) {
+              // a matched period
               mostRecent = totals[totalsIndex].balance;
               totalsIndex += 1;
             } else {
-              // a missing month in the middle
+              // a missing period in the middle
               totals.push({
-                date: expectedMonth,
+                date: expectedPeriod,
                 balance: mostRecent,
               });
             }
           });
         }
 
+        const dateFormat =
+          granularity === 'day' ? 'MMM d yyyy' : 'MMM yyyy';
         const balances = totals
-          .sort((a, b) => monthUtils.differenceInCalendarMonths(a.date, b.date))
-          .map(t => {
-            return {
-              balance: t.balance,
-              date: monthUtils.format(t.date, 'MMM yyyy', locale),
-            };
-          });
+          .sort((a, b) =>
+            granularity === 'day'
+              ? differenceInCalendarDays(
+                  monthUtils._parse(a.date),
+                  monthUtils._parse(b.date),
+                )
+              : monthUtils.differenceInCalendarMonths(a.date, b.date),
+          )
+          .map(t => ({
+            balance: t.balance,
+            date: monthUtils.format(t.date, dateFormat, locale),
+          }));
 
         setBalanceData(balances);
         setHoveredValue(balances[balances.length - 1]);
@@ -195,7 +245,14 @@ export function BalanceHistoryGraph({
 
       processData(startingBalance, monthlyTotals);
     }
-  }, [startingBalance, monthlyTotals, locale]);
+  }, [
+    startingBalance,
+    monthlyTotals,
+    granularity,
+    startDateProp,
+    endDateProp,
+    locale,
+  ]);
 
   // State to track if the chart is hovered (used to conditionally render PrivacyFilter)
   const [isHovered, setIsHovered] = useState(false);
